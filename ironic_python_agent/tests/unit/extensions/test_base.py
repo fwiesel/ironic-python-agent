@@ -53,6 +53,26 @@ class FakeExtension(base.BaseAgentExtension):
         pass
 
 
+class AdmissionProbeExtension(base.BaseAgentExtension):
+    """Extension that records the history at the moment it starts."""
+
+    def __init__(self, agent=None):
+        super(AdmissionProbeExtension, self).__init__(agent=agent)
+        self.admitted_at_start = None
+        self.calls = 0
+
+    @base.async_command('admission_probe')
+    def admission_probe(self, param=None):
+        self.calls += 1
+        self.admitted_at_start = 'stable-id' in self.agent.command_results
+        return param
+
+    @base.sync_command('admission_sync_probe')
+    def admission_sync_probe(self, param=None):
+        self.calls += 1
+        return param
+
+
 class FakeAgent(base.ExecuteCommandMixin):
     def __init__(self):
         super(FakeAgent, self).__init__()
@@ -127,6 +147,82 @@ class TestExecuteCommandMixin(test_base.IronicAgentTest):
         }
         self.assertRaises(errors.AgentIsBusy,
                           self.agent.execute_command, 'fake.fake_sync_command')
+
+
+class TestCommandAdmission(test_base.IronicAgentTest):
+    """Admission binds a stable command identity before a start.
+
+    The conductor owns the command identity in agent-poll mode. The agent
+    must record that identity before an asynchronous command starts, so a
+    redelivery cannot start the effect a second time.
+    """
+
+    def setUp(self):
+        super(TestCommandAdmission, self).setUp()
+        self.agent = FakeAgent()
+        self.probe = AdmissionProbeExtension(agent=self.agent)
+        self.agent.ext_mgr = extension.ExtensionManager.make_test_instance(
+            [extension.Extension('probe', None, AdmissionProbeExtension,
+                                 self.probe)])
+
+    def test_admits_stable_id_before_async_start(self):
+        result = self.agent.admit_command(
+            'stable-id', 'probe.admission_probe', param='v1')
+
+        result.join()
+
+        self.assertEqual('stable-id', result.id)
+        self.assertTrue(self.probe.admitted_at_start)
+        self.assertEqual(1, self.probe.calls)
+
+    def test_repeated_id_with_same_params_is_not_reexecuted(self):
+        first = self.agent.admit_command(
+            'stable-id', 'probe.admission_probe', param='v1')
+        first.join()
+
+        second = self.agent.admit_command(
+            'stable-id', 'probe.admission_probe', param='v1')
+
+        self.assertIs(first, second)
+        self.assertEqual(1, self.probe.calls)
+
+    def test_changed_params_for_same_id_are_rejected(self):
+        first = self.agent.admit_command(
+            'stable-id', 'probe.admission_probe', param='v1')
+        first.join()
+
+        self.assertRaises(
+            errors.AgentCommandConflict, self.agent.admit_command,
+            'stable-id', 'probe.admission_probe', param='v2')
+        self.assertEqual(1, self.probe.calls)
+
+    def test_changed_name_for_same_id_is_rejected(self):
+        first = self.agent.admit_command(
+            'stable-id', 'probe.admission_probe', param='v1')
+        first.join()
+
+        self.assertRaises(
+            errors.AgentCommandConflict, self.agent.admit_command,
+            'stable-id', 'probe.admission_sync_probe', param='v1')
+        self.assertEqual(1, self.probe.calls)
+
+    def test_sync_command_uses_stable_id(self):
+        result = self.agent.admit_command(
+            'sync-id', 'probe.admission_sync_probe', param='v1')
+
+        self.assertEqual('sync-id', result.id)
+        self.assertEqual(base.AgentCommandStatus.SUCCEEDED,
+                         result.command_status)
+
+    def test_history_retention_is_bounded(self):
+        self.agent.max_command_results = 2
+
+        for index in range(3):
+            self.agent.admit_command(
+                'sync-%d' % index, 'probe.admission_sync_probe')
+
+        self.assertEqual(['sync-1', 'sync-2'],
+                         list(self.agent.command_results))
 
 
 class TestExtensionDecorators(test_base.IronicAgentTest):
